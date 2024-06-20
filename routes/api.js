@@ -1,7 +1,116 @@
 const express = require('express');
 const admin = require('firebase-admin');
+const dotenv = require('dotenv');
+const url = require('url');
+const { OAuth2Client } = require('google-auth-library');
+
+dotenv.config();
 
 const router = express.Router();
+const googleClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  process.env.GOOGLE_REDIRECT_URI
+);
+
+// AUTH
+
+// Middleware to verify ID token
+const verifyToken = async (req, res, next) => {
+  const idToken = req.headers.authorization?.split('Bearer ')[1];
+  console.log('verifyToken got', idToken)
+  if (!idToken) {
+    return res.status(401).json({ error: 'No token provided.' });
+  }
+
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(idToken);
+    req.user = decodedToken;
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token.' });
+  }
+};
+
+// Google Sign-In Route
+router.get('/google-signin', (req, res) => {
+  const authUrl = googleClient.generateAuthUrl({
+    access_type: 'offline',
+    scope: ['profile', 'email'],
+  });
+  res.redirect(authUrl);
+});
+
+router.get('/google-callback', async (req, res) => {
+  const { code } = req.query;
+  console.log('req.query', req.query)
+  try {
+    const { tokens } = googleClient.getToken({ code, redirect_uri: process.env.GOOGLE_REDIRECT_URI });
+    googleClient.setCredentials(tokens);
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    const userId = payload['sub'];
+    let user = await admin.auth().getUser(userId).catch(async () => {
+      user = await admin.auth().createUser({
+        uid: userId,
+        email: payload.email,
+        displayName: payload.name,
+      });
+    });
+
+    // if (user) {
+    //   console.log('user', user);
+    // } else {
+    //   console.log('no user');
+    // }
+    const customToken = await admin.auth().createCustomToken(user.uid);
+    console.log('Custom Token:', customToken);
+
+    // Construct the redirect URL with the correct base URL
+    const baseUrl = process.env.BASE_URL || 'http://localhost:5173';
+    const redirectUrl = new URL('/cms/dashboard', baseUrl);
+    redirectUrl.searchParams.append('authToken', encodeURIComponent(customToken));
+
+    // Redirect the client's browser to the constructed URL
+    const clientSuccessUrl = redirectUrl.toString();
+    console.log('Redirecting to:', clientSuccessUrl);
+    res.redirect(clientSuccessUrl);
+
+  } catch (error) {
+    console.error('Error during Google callback:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Anonymous Sign-In Route
+router.post('/anonymous-signin', async (req, res) => {
+  try {
+    const userRecord = await admin.auth().createUser({});
+    const customToken = await admin.auth().createCustomToken(userRecord.uid);
+    res.status(200).json({ authToken: customToken });
+    
+    // Parse the Referer URL and construct the redirect URL
+    const refererUrl = new URL(req.headers.referer);
+    const redirectUrl = new URL('/cms/dashboard', refererUrl);
+    redirectUrl.searchParams.append('authToken', encodeURIComponent(customToken));
+
+    // Redirect the client's browser to the constructed URL
+    const clientSuccessUrl = url.format(redirectUrl);
+    console.log('success?', clientSuccessUrl);
+    res.redirect(clientSuccessUrl);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Example protected route
+router.get('/protected', verifyToken, (req, res) => {
+  res.status(200).json({ message: 'This is a protected route', user: req.user });
+});
+
 
 // FETCH
 
@@ -33,10 +142,8 @@ const getUserAuthorizedSites = async (userID) => {
 const getSiteData = async (siteID, path = '') => {
   try {
     const db = admin.database();
-
     // Construct the database path, ensuring no trailing slash
     const dbPath = `sites/${siteID}/${path}`.replace(/\/$/, '');
-
     const ref = db.ref(dbPath);
     const snapshot = await ref.once('value');
     return snapshot.val();
